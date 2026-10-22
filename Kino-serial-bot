@@ -1,0 +1,218 @@
+# -*- coding: utf-8 -*-
+"""Kino/serial Telegram bot. Faqat tarqatishga ruxsatli videolarni qo'shing."""
+import sqlite3, logging
+from datetime import datetime
+from html import escape
+import telebot
+from telebot import types
+
+# Sozlamalar:
+TOKEN = "8876169392:AAELLkE6BXsQPPFDFsSMZuIQneq0ra7rRRU"
+ADMIN_ID = 1140946259 # @userinfobot orqali olingan raqamli ID
+REQUIRED_CHANNEL = ""  # Masalan "@meningkanalim"; shart bo'lmasa "" qoldiring
+DB_FILE = "kino_serial_baza.sqlite3"
+
+if TOKEN == "BU_YERGA_YANGI_BOT_TOKENINI_QOYING" or not TOKEN.strip():
+    raise SystemExit("TOKEN maydonini to'ldiring.")
+if not isinstance(ADMIN_ID, int) or ADMIN_ID <= 0:
+    raise SystemExit("ADMIN_ID raqamli Telegram ID bo'lishi kerak.")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.execute("PRAGMA foreign_keys=ON")
+db.executescript("""
+CREATE TABLE IF NOT EXISTS items(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL,
+ title TEXT NOT NULL, kind TEXT NOT NULL, description TEXT DEFAULT '',
+ created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS episodes(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL,
+ episode_no INTEGER NOT NULL, file_id TEXT NOT NULL, caption TEXT DEFAULT '',
+ created_at TEXT NOT NULL, UNIQUE(item_id,episode_no),
+ FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, first_seen TEXT NOT NULL);
+""")
+db.commit()
+pending = {}
+
+def admin(m): return bool(m.from_user and m.from_user.id == ADMIN_ID)
+def esc(s): return escape(str(s), quote=False)
+def now(): return datetime.utcnow().isoformat(timespec="seconds")
+def kb_main():
+    k=types.ReplyKeyboardMarkup(resize_keyboard=True)
+    k.row("🔎 Kino/serial qidirish","📊 Bot haqida")
+    if True: return k
+def remember(uid):
+    db.execute("INSERT OR IGNORE INTO users VALUES(?,?)",(uid,now())); db.commit()
+def subscribed(uid):
+    if not REQUIRED_CHANNEL: return True
+    try: return bot.get_chat_member(REQUIRED_CHANNEL,uid).status in ("creator","administrator","member")
+    except Exception: logging.exception("Obuna tekshiruvi"); return False
+def ask_sub(chat):
+    k=types.InlineKeyboardMarkup()
+    k.add(types.InlineKeyboardButton("📢 Kanalga obuna bo'lish",url="https://t.me/"+REQUIRED_CHANNEL.lstrip("@")))
+    k.add(types.InlineKeyboardButton("✅ Tekshirish",callback_data="subcheck"))
+    bot.send_message(chat,"Avval kanalga obuna bo'ling, keyin tekshiring.",reply_markup=k)
+def allowed(m):
+    if admin(m) or subscribed(m.from_user.id): return True
+    ask_sub(m.chat.id); return False
+def find(q):
+    r=db.execute("SELECT * FROM items WHERE code=? COLLATE NOCASE",(q.strip(),)).fetchall()
+    if r: return r
+    return db.execute("SELECT * FROM items WHERE title LIKE ? COLLATE NOCASE ORDER BY title LIMIT 25",("%"+q.strip()+"%",)).fetchall()
+def show(chat,item_id):
+    it=db.execute("SELECT * FROM items WHERE id=?",(item_id,)).fetchone()
+    if not it: bot.send_message(chat,"Bu kino/serial topilmadi."); return
+    eps=db.execute("SELECT episode_no,id FROM episodes WHERE item_id=? ORDER BY episode_no",(item_id,)).fetchall()
+    text=f'{"📺 Serial" if it["kind"]=="series" else "🎬 Kino"}: <b>{esc(it["title"])}</b>\nKod: <code>{esc(it["code"])}</code>'
+    if it["description"]: text+="\n"+esc(it["description"])
+    k=types.InlineKeyboardMarkup()
+    if it["kind"]=="movie":
+        if eps: k.add(types.InlineKeyboardButton("▶️ Videoni yuborish",callback_data=f'play:{eps[0]["id"]}'))
+        else: text+="\nVideo hali qo'shilmagan."
+    elif eps:
+        for i in range(0,len(eps),4):
+            k.row(*[types.InlineKeyboardButton(f'{e["episode_no"]}-qism',callback_data=f'ep:{item_id}:{e["episode_no"]}') for e in eps[i:i+4]])
+    else: text+="\nQismlar hali qo'shilmagan."
+    bot.send_message(chat,text,reply_markup=k if k.keyboard else None)
+def search(chat,q):
+    rows=find(q)
+    if not rows: bot.send_message(chat,"😕 Topilmadi. Baza ichidagi nom yoki kodni tekshiring."); return
+    if len(rows)==1: show(chat,rows[0]["id"]); return
+    k=types.InlineKeyboardMarkup()
+    for it in rows[:20]:
+        k.add(types.InlineKeyboardButton(f'{"📺" if it["kind"]=="series" else "🎬"} {it["title"]} · {it["code"]}',callback_data=f'item:{it["id"]}'))
+    bot.send_message(chat,"Natijalardan birini tanlang:",reply_markup=k)
+def parse_title_code(s):
+    if "|" not in s: raise ValueError("Format: Nomi | KOD")
+    title,code=s.rsplit("|",1); title=title.strip(); code=code.strip()
+    if not title or not code or len(title)>200 or len(code)>50: raise ValueError("Nom/kodni tekshiring (nom 200, kod 50 belgigacha).")
+    return title,code
+def add_item(m,kind):
+    if not admin(m): return
+    try: title,code=parse_title_code(m.text.partition(" ")[2])
+    except ValueError as e:
+        bot.reply_to(m,f'{esc(e)}\nMasalan: <code>/{ "addmovie" if kind=="movie" else "addseries"} Interstellar | 101</code>'); return
+    try:
+        cur=db.execute("INSERT INTO items(code,title,kind,created_at) VALUES(?,?,?,?)",(code,title,kind,now())); db.commit()
+    except sqlite3.IntegrityError: bot.reply_to(m,"Bu kod band. Boshqa kod tanlang."); return
+    pending[m.from_user.id]={"item_id":cur.lastrowid,"episode_no":1}
+    bot.reply_to(m,f'<b>{esc(title)}</b> yaratildi. Endi video yuboring (video yoki video hujjat). /cancel — bekor qilish')
+@bot.message_handler(commands=["start"])
+def start(m):
+    remember(m.from_user.id)
+    if allowed(m): bot.send_message(m.chat.id,"🎬 <b>Kino va Serial botiga xush kelibsiz!</b>\nKino/serial nomini yoki kodini yozing.",reply_markup=kb_main())
+@bot.message_handler(commands=["help"])
+def help_cmd(m):
+    t="/start — bosh menyu\nKino/serial nomi yoki kodini yozing."
+    if admin(m): t+="\n\nAdmin:\n/addmovie Nomi | KOD\n/addseries Nomi | KOD\n/episode SERIAL_KOD | QISM\n/desc KOD | TAVSIF\n/delete KOD\n/list\n/stats\n/cancel"
+    bot.reply_to(m,t)
+@bot.message_handler(commands=["admin"])
+def admin_cmd(m):
+    if admin(m): bot.reply_to(m,"Admin buyruqlari uchun /help ni ko'ring.")
+@bot.message_handler(commands=["addmovie"])
+def addmovie(m): add_item(m,"movie")
+@bot.message_handler(commands=["addseries"])
+def addseries(m): add_item(m,"series")
+@bot.message_handler(commands=["episode"])
+def episode(m):
+    if not admin(m): return
+    try:
+        code,n=m.text.partition(" ")[2].split("|",1); code=code.strip(); n=int(n.strip())
+        if n<1: raise ValueError()
+    except Exception: bot.reply_to(m,"Format: /episode SERIAL_KOD | QISM"); return
+    it=db.execute("SELECT * FROM items WHERE code=? AND kind='series'",(code,)).fetchone()
+    if not it: bot.reply_to(m,"Serial topilmadi; avval /addseries bilan yarating."); return
+    pending[m.from_user.id]={"item_id":it["id"],"episode_no":n}
+    bot.reply_to(m,f'{esc(it["title"])} — {n}-qism videosini yuboring.')
+@bot.message_handler(commands=["desc"])
+def desc(m):
+    if not admin(m): return
+    try: code,d=m.text.partition(" ")[2].split("|",1); code=code.strip(); d=d.strip()
+    except ValueError: bot.reply_to(m,"Format: /desc KOD | Tavsif"); return
+    cur=db.execute("UPDATE items SET description=? WHERE code=?",(d,code)); db.commit()
+    bot.reply_to(m,"Tavsif saqlandi." if cur.rowcount else "Kod topilmadi.")
+@bot.message_handler(commands=["delete"])
+def delete(m):
+    if not admin(m): return
+    code=m.text.partition(" ")[2].strip()
+    it=db.execute("SELECT id,title FROM items WHERE code=?",(code,)).fetchone()
+    if not it: bot.reply_to(m,"Kod topilmadi."); return
+    db.execute("DELETE FROM episodes WHERE item_id=?",(it["id"],)); db.execute("DELETE FROM items WHERE id=?",(it["id"],)); db.commit()
+    bot.reply_to(m,f'🗑 {esc(it["title"])} o‘chirildi.')
+@bot.message_handler(commands=["list"])
+def listing(m):
+    if not admin(m): return
+    rows=db.execute("SELECT i.code,i.title,i.kind,COUNT(e.id) n FROM items i LEFT JOIN episodes e ON e.item_id=i.id GROUP BY i.id ORDER BY i.id DESC LIMIT 80").fetchall()
+    if not rows: bot.reply_to(m,"Katalog bo'sh."); return
+    out="📚 Katalog:\n"+"\n".join(f'{r["code"]} — {esc(r["title"])} ({"serial" if r["kind"]=="series" else "kino"}, {r["n"]} video)' for r in rows)
+    bot.reply_to(m,out[:4000])
+@bot.message_handler(commands=["stats"])
+def stats(m):
+    if not admin(m): return
+    n=lambda q: db.execute(q).fetchone()[0]
+    bot.reply_to(m,f'📊 Foydalanuvchilar: {n("SELECT COUNT(*) FROM users")}\nKino/serial: {n("SELECT COUNT(*) FROM items")}\nVideo/qism: {n("SELECT COUNT(*) FROM episodes")}')
+@bot.message_handler(commands=["cancel"])
+def cancel(m):
+    pending.pop(m.from_user.id,None); bot.reply_to(m,"Amal bekor qilindi.",reply_markup=kb_main())
+@bot.callback_query_handler(func=lambda c: True)
+def callbacks(c):
+    try:
+        if c.data=="subcheck":
+            if subscribed(c.from_user.id): bot.answer_callback_query(c.id,"Obuna tasdiqlandi"); bot.send_message(c.message.chat.id,"Endi qidirishingiz mumkin.",reply_markup=kb_main())
+            else: bot.answer_callback_query(c.id,"Obuna aniqlanmadi.",show_alert=True)
+        elif c.data.startswith("item:"): bot.answer_callback_query(c.id); show(c.message.chat.id,int(c.data.split(":")[1]))
+        elif c.data.startswith("play:") or c.data.startswith("ep:"):
+            if not subscribed(c.from_user.id) and c.from_user.id!=ADMIN_ID: bot.answer_callback_query(c.id,"Avval kanalga obuna bo'ling.",show_alert=True); return
+            if c.data.startswith("play:"):
+                eid=int(c.data.split(":")[1])
+            else:
+                _,iid,num=c.data.split(":")
+                row=db.execute("SELECT id FROM episodes WHERE item_id=? AND episode_no=?",(int(iid),int(num))).fetchone()
+                if not row: bot.answer_callback_query(c.id,"Qism topilmadi.",show_alert=True); return
+                eid=row["id"]
+            row=db.execute("SELECT e.file_id,e.episode_no,i.title,i.kind FROM episodes e JOIN items i ON i.id=e.item_id WHERE e.id=?",(eid,)).fetchone()
+            if row:
+                bot.answer_callback_query(c.id,"Video yuborilmoqda…")
+                cap=f'{"📺" if row["kind"]=="series" else "🎬"} {esc(row["title"])}'
+                if row["kind"]=="series": cap+=f' — {row["episode_no"]}-qism'
+                bot.send_video(c.message.chat.id,row["file_id"],caption=cap)
+            else: bot.answer_callback_query(c.id,"Video topilmadi.",show_alert=True)
+        else: bot.answer_callback_query(c.id)
+    except Exception:
+        logging.exception("Callback xatosi")
+        try: bot.answer_callback_query(c.id,"Xatolik. Qayta urinib ko'ring.",show_alert=True)
+        except Exception: pass
+@bot.message_handler(content_types=["video","document"])
+def receive_video(m):
+    if not admin(m): return
+    state=pending.get(m.from_user.id)
+    if not state: bot.reply_to(m,"Avval /addmovie, /addseries yoki /episode buyrug'ini yuboring."); return
+    file_id=None
+    if m.video: file_id=m.video.file_id
+    elif m.document and ((m.document.mime_type or "").startswith("video/") or (m.document.file_name or "").lower().endswith((".mp4",".mkv",".mov",".avi",".webm"))): file_id=m.document.file_id
+    if not file_id: bot.reply_to(m,"Video yoki video formatidagi hujjat yuboring."); return
+    it=db.execute("SELECT * FROM items WHERE id=?",(state["item_id"],)).fetchone()
+    if not it: pending.pop(m.from_user.id,None); bot.reply_to(m,"Yozuv topilmadi."); return
+    try:
+        db.execute("INSERT OR REPLACE INTO episodes(item_id,episode_no,file_id,caption,created_at) VALUES(?,?,?,?,?)",(it["id"],state["episode_no"],file_id,m.caption or "",now())); db.commit()
+        pending.pop(m.from_user.id,None)
+        if it["kind"]=="series": bot.reply_to(m,f'✅ {esc(it["title"])} — {state["episode_no"]}-qism saqlandi.\nKeyingi qism: <code>/episode {esc(it["code"])} | {state["episode_no"]+1}</code>')
+        else: bot.reply_to(m,f'✅ {esc(it["title"])} videosi saqlandi. Kod: <code>{esc(it["code"])}</code>')
+    except Exception: logging.exception("Saqlash xatosi"); bot.reply_to(m,"Bazaga saqlashda xato.")
+@bot.message_handler(content_types=["text"])
+def text_router(m):
+    remember(m.from_user.id)
+    if not allowed(m): return
+    t=m.text.strip()
+    if t=="📊 Bot haqida": bot.reply_to(m,"Kino/serial nomi yoki kodini yozing.",reply_markup=kb_main()); return
+    if t=="🔎 Kino/serial qidirish": bot.reply_to(m,"Kino yoki serial nomi/kodini yozing."); return
+    if t.startswith("/"): return
+    search(m.chat.id,t)
+def main():
+    logging.info("Bot ishga tushmoqda")
+    bot.remove_webhook()
+    bot.infinity_polling(skip_pending=True,timeout=30,long_polling_timeout=30)
+if __name__=="__main__": main()
